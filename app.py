@@ -14,6 +14,8 @@ OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
 
+client = openai.OpenAI(api_key=openai.api_key)
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     explanation = None
@@ -37,7 +39,7 @@ def index():
 
         # Step 2: Format and send to OpenAI
         prompt = f"Explain this weather data for {city} on {date_str}:\n{weather_data}"
-        ai_response = openai.ChatCompletion.create(
+        ai_response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300
