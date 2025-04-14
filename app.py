@@ -4,119 +4,276 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from geopy.distance import geodesic
-import openai
 
+# Load environment variables from .env, etc.
 load_dotenv()
 app = Flask(__name__)
 
-# Initialize the OpenAI client once using the API key from the environment.
-openai.api_key = os.getenv("OPENAI_API_KEY")
+#############################
+# OpenRouter API settings
+#############################
+# Set your OpenRouter API token here.
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/reasoning"
+OPENROUTER_API_TOKEN = "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"  # Replace with your actual token.
+openrouter_headers = {"Authorization": f"Bearer {OPENROUTER_API_TOKEN}"}
 
+#############################
+# Global Station Metadata Fetching
+#############################
+STATION_METADATA_URL = "https://opendata-download-metobs.smhi.se/api/version/1.0/parameter/1.json"
 
+def fetch_station_metadata():
+    try:
+        response = requests.get(STATION_METADATA_URL)
+        response.raise_for_status()
+        meta_data = response.json()
+        return meta_data.get("station", [])
+    except Exception as e:
+        print("Failed to fetch SMHI station metadata:", e)
+        return []
+
+# Fetch station metadata once at startup.
+STATION_METADATA = fetch_station_metadata()
+print(f"Fetched {len(STATION_METADATA)} stations from SMHI metadata.")
+
+#############################
+# Helper Function to Transform Timestamps
+#############################
+def transform_timestamps(data_list):
+    """
+    Convert each observation's 'date' (epoch in milliseconds) to a human‑readable UTC date string.
+    Adds a new key "readable_date" to each record.
+    """
+    for record in data_list:
+        record['readable_date'] = datetime.utcfromtimestamp(record['date'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+    return data_list
+
+#############################
+# Routes
+#############################
 @app.route("/", methods=["GET", "POST"])
 def index():
-    explanation = None
+    coordinates = None
+    selected_date = None
+    station_info = None
+    weather_data = None
+    query_url = None
+    error_message = None
+    llm_answer = None  # This will hold the summary from OpenRouter
+
     if request.method == "POST":
         city = request.form["city"]
         date_str = request.form["date"]
-        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
 
-        lat, lon = geocode_city(city)
-        if not lat or not lon:
-            explanation = "Could not find that city."
-        else:
-            station_id = find_nearest_smhi_station(lat, lon)
-            if not station_id:
-                explanation = "No nearby SMHI weather station found."
+        try:
+            selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            error_message = "Invalid date format."
+
+        if city and selected_date:
+            coordinates = geocode_city(city)
+            if not coordinates:
+                error_message = "Could not find that city."
             else:
-                smhi_data = get_smhi_temperature_data(station_id, date_obj)
-                if not smhi_data:
-                    explanation = "No weather data available for that date."
+                station_info = find_station_with_data(coordinates[0], coordinates[1], selected_date)
+                if not station_info:
+                    error_message = "No station found with data for the selected date."
                 else:
-                    summary = "\n".join([
-                        f"{datetime.fromtimestamp(d['date']/1000).strftime('%H:%M')} — {d['value']}°C"
-                        for d in smhi_data
-                    ])
-                    # Create a prompt for ChatGPT
-                    prompt = f"Summarize this weather data from {city} on {date_str}:\n{summary}"
-                    response = openai.ChatCompletion.create(
-                        model="gpt-3.5-turbo",
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=300
-                    )
-                    explanation = response.choices[0].message.content
+                    station_id = station_info.get("id")
+                    today = datetime.today()
+                    if selected_date.date() >= today.date():
+                        weather_data, query_url = get_smhi_temperature_data_forecast(coordinates[0], coordinates[1], selected_date)
+                    else:
+                        if selected_date.date() >= today.date() - timedelta(days=90):
+                            period = "latest-month"
+                        else:
+                            period = "corrected-archive"
+                        weather_data, query_url = get_smhi_temperature_data_historical(station_id, selected_date, period)
+                    
+                    if not weather_data or len(weather_data) == 0:
+                        error_message = "No weather data available for that date."
+                    else:
+                        weather_data = transform_timestamps(weather_data)
+                        # Generate a weather summary using OpenRouter.
+                        llm_answer = get_llm_summary(city, selected_date, weather_data)
+    
+    return render_template("index.html",
+                           coordinates=coordinates,
+                           selected_date=selected_date,
+                           station_info=station_info,
+                           weather_data=weather_data,
+                           query_url=query_url,
+                           error_message=error_message,
+                           llm_answer=llm_answer)
 
-    return render_template("index.html", explanation=explanation)
-
-
-# 1. Convert city name to coordinates using OpenCage
+#############################
+# Helper Functions for Geocoding and Station Lookup
+#############################
 def geocode_city(city_name):
     api_key = os.getenv("OPENCAGE_API_KEY")
     url = f"https://api.opencagedata.com/geocode/v1/json?q={city_name}&key={api_key}"
     response = requests.get(url)
     data = response.json()
-
-    print(data)
-    print("HÄR_______________________________")
-
-    if data["results"]:
+    print("OpenCage response:", data)
+    if data.get("results"):
         lat = data["results"][0]["geometry"]["lat"]
         lon = data["results"][0]["geometry"]["lng"]
         return lat, lon
     return None, None
 
+def find_station_with_data(user_lat, user_lon, date_obj):
+    """
+    Use pre-fetched STATION_METADATA to select the nearest station that has data for the requested date.
+    The function sorts stations by distance from the user and returns the first station whose metadata's
+    update time is on or after the requested date.
+    """
+    if not STATION_METADATA:
+        return None
 
-# 2. Find the nearest SMHI weather station using version 1.0
-def find_nearest_smhi_station(user_lat, user_lon):
-    # Use version 1.0 endpoint to retrieve station metadata
-    url = f"https://opendata-download-metobs.smhi.se/api/version/latest/parameter/1/station/{station_id}/period/latest-month/data.json"
+    def station_distance(station):
+        return geodesic((user_lat, user_lon), (station["latitude"], station["longitude"])).km
 
-    response = requests.get(url)
-    data = response.json()
+    valid_stations = []
+    for station in STATION_METADATA:
+        updated_val = station.get("updated")
+        if not updated_val:
+            continue
+        try:
+            if isinstance(updated_val, str):
+                update_dt = datetime.fromisoformat(updated_val.replace("Z", "+00:00"))
+            else:
+                update_dt = datetime.fromtimestamp(float(updated_val) / 1000.0)
+            station["update_datetime"] = update_dt
+            valid_stations.append(station)
+        except Exception as e:
+            print(f"Error parsing update for station {station.get('id')}: {e}")
+            continue
 
-    nearest_station = None
-    shortest_distance = float("inf")
+    if not valid_stations:
+        return None
 
-    for station in data.get("station", []):
-        station_lat = station["latitude"]
-        station_lon = station["longitude"]
-        dist = geodesic((user_lat, user_lon), (station_lat, station_lon)).km
+    valid_stations.sort(key=station_distance)
+    for station in valid_stations:
+        if station.get("update_datetime") and station["update_datetime"] >= date_obj:
+            print(f"Selected station {station['id']} (updated: {station['update_datetime']})")
+            return station
+    return valid_stations[0]
 
-        if dist < shortest_distance:
-            shortest_distance = dist
-            nearest_station = station
-
-    if nearest_station:
-        print("Nearest station ID:", nearest_station["id"])
-        return nearest_station["id"]
-    return None
-
-
-# 3. Get temperature data from SMHI using version 1.0 observation endpoint
-def get_smhi_temperature_data(station_id, date_obj):
-    # Calculate the start and end of the day in milliseconds
+#############################
+# Data Fetching Functions
+#############################
+def get_smhi_temperature_data_historical(station_id, date_obj, period_product):
+    """
+    Fetch historical weather data for a given station ID and date.
+    period_product should be "latest-month" or "corrected-archive".
+    Returns (day_data, query_url).
+    """
     start = int(datetime(date_obj.year, date_obj.month, date_obj.day).timestamp() * 1000)
     end = int((datetime(date_obj.year, date_obj.month, date_obj.day) + timedelta(days=1)).timestamp() * 1000)
-
-    # Use the SMHI version 1.0 endpoint in JSON format (without "/period/latest-day/")
-    url = f"https://opendata-download-metobs.smhi.se/api/version/1.0/parameter/1/station/{station_id}.json"
-    response = requests.get(url)
-
-    print("SMHI API status code:", response.status_code)
-    print("SMHI API response (first 200 chars):", response.text[:200])
     
+    if period_product == "latest-month":
+        query_url = f"https://opendata-download-metobs.smhi.se/api/version/1.0/parameter/1/station/{station_id}/period/latest-months/data.json"
+    elif period_product == "corrected-archive":
+        query_url = f"https://opendata-download-metobs.smhi.se/api/version/1.0/parameter/1/station/{station_id}/period/corrected-archive.json"
+    else:
+        query_url = f"https://opendata-download-metobs.smhi.se/api/version/1.0/parameter/1/station/{station_id}/period/latest-months/data.json"
+    
+    response = requests.get(query_url)
+    print(f"Historical SMHI API ({period_product}) status code:", response.status_code)
+    print(f"Historical SMHI API ({period_product}) response (first 200 chars):", response.text[:200])
     try:
         data = response.json()
     except requests.exceptions.JSONDecodeError:
-        print("❌ Failed to decode JSON from SMHI API!")
-        return []
+        print("❌ Failed to decode historical SMHI JSON!")
+        return ([], query_url)
     
-    # Extract observations from the "observations" key if present.
-    observations = data.get("observations", {}).get("value", [])
-    day_data = [obs for obs in observations if start <= obs["date"] < end]
+    observations = data.get("value", [])
+    day_data = [obs for obs in observations if start <= obs.get("date", 0) < end]
+    return day_data, query_url
 
-    return day_data
+def get_smhi_temperature_data_forecast(lat, lon, date_obj):
+    """
+    Fetch forecast weather data using the SMHI forecast endpoint.
+    Coordinates are rounded to three decimal places.
+    Returns (forecasts, query_url).
+    """
+    lon_str = f"{lon:.3f}"
+    lat_str = f"{lat:.3f}"
+    base_url = "https://opendata-download-metfcst.smhi.se/api/category/pmp3g/version/2"
+    url = f"{base_url}/geotype/point/lon/{lon_str}/lat/{lat_str}/data.json"
+    response = requests.get(url)
+    print("Forecast SMHI API status code:", response.status_code)
+    print("Forecast SMHI API response (first 200 chars):", response.text[:200])
+    try:
+        data = response.json()
+    except Exception as e:
+        print("❌ Failed to decode forecast SMHI JSON!", e)
+        return ([], url)
+    forecasts = []
+    for entry in data.get("timeSeries", []):
+        valid_time = datetime.fromisoformat(entry["validTime"].replace("Z", "+00:00"))
+        if valid_time.date() == date_obj.date():
+            temp = None
+            for param in entry.get("parameters", []):
+                if param.get("name") == "t":
+                    temp = param.get("values", [])[0]
+                    break
+            if temp is not None:
+                forecasts.append({
+                    "date": int(valid_time.timestamp() * 1000),
+                    "value": temp
+                })
+    return forecasts, url
 
+#############################
+# LLM Summary Function using OpenRouter
+#############################
+def get_llm_summary(city, date_obj, weather_data):
+    """
+    Build a prompt from the weather data summary and query OpenRouter's API for text generation.
+    This function uses the text-generation task.
+    """
+    temperatures = []
+    for record in weather_data:
+        try:
+            temperatures.append(float(record["value"]))
+        except Exception as conv_e:
+            print(f"Skipping invalid temperature value {record.get('value')}: {conv_e}")
+    if temperatures:
+        min_temp = min(temperatures)
+        max_temp = max(temperatures)
+        avg_temp = sum(temperatures) / len(temperatures)
+        summary_line = f"Min: {min_temp}°C, Max: {max_temp}°C, Avg: {avg_temp:.1f}°C"
+    else:
+        summary_line = "No temperature data available."
+    
+    prompt = (
+        f"Based on the weather data for {city} on {date_obj.strftime('%Y-%m-%d')}, which is summarized as: {summary_line}.\n\n"
+        "Please provide a friendly summary of what the weather will be like and suggest some activities for that day in a conversational tone."
+    )
+    
+    # Use OpenRouter's endpoint. OpenRouter's API is similar to OpenAI's.
+    OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+    
+    payload = {
+        "model": "gpt-3.5-turbo",   # You can change this if desired.
+        "messages": [
+            {"role": "system", "content": "You are a helpful weather assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 150
+    }
+    
+    try:
+        response = requests.post(OPENROUTER_API_URL, headers={"Authorization": f"Bearer {OPENROUTER_API_TOKEN}"}, json=payload, timeout=60)
+        print("OpenRouter API status code:", response.status_code)
+        print("OpenRouter raw response text:", response.text)
+        response.raise_for_status()
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+    except Exception as e:
+        print("Error calling OpenRouter API:", e)
+        return "Sorry, I couldn't generate a weather summary at this time."
 
 if __name__ == "__main__":
     app.run(debug=True)
