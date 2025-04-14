@@ -5,16 +5,16 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from geopy.distance import geodesic
 
-# Load environment variables from .env, etc.
+# Load environment variables (make sure your .env file is in the same directory)
 load_dotenv()
 app = Flask(__name__)
 
 #############################
 # OpenRouter API settings
 #############################
-# Set your OpenRouter API token here.
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/reasoning"
-OPENROUTER_API_TOKEN = "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"  # Replace with your actual token.
+# The OpenRouter API key is now loaded from the environment.
+OPENROUTER_API_TOKEN = os.getenv("OPENROUTER_API_TOKEN")
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 openrouter_headers = {"Authorization": f"Bearer {OPENROUTER_API_TOKEN}"}
 
 #############################
@@ -32,7 +32,7 @@ def fetch_station_metadata():
         print("Failed to fetch SMHI station metadata:", e)
         return []
 
-# Fetch station metadata once at startup.
+# Fetch metadata once at startup.
 STATION_METADATA = fetch_station_metadata()
 print(f"Fetched {len(STATION_METADATA)} stations from SMHI metadata.")
 
@@ -41,8 +41,8 @@ print(f"Fetched {len(STATION_METADATA)} stations from SMHI metadata.")
 #############################
 def transform_timestamps(data_list):
     """
-    Convert each observation's 'date' (epoch in milliseconds) to a human‑readable UTC date string.
-    Adds a new key "readable_date" to each record.
+    Convert each observation's 'date' (epoch in milliseconds) to a human‐readable date string (UTC)
+    and add it as a new key "readable_date" to each record.
     """
     for record in data_list:
         record['readable_date'] = datetime.utcfromtimestamp(record['date'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
@@ -94,7 +94,6 @@ def index():
                         error_message = "No weather data available for that date."
                     else:
                         weather_data = transform_timestamps(weather_data)
-                        # Generate a weather summary using OpenRouter.
                         llm_answer = get_llm_summary(city, selected_date, weather_data)
     
     return render_template("index.html",
@@ -123,9 +122,9 @@ def geocode_city(city_name):
 
 def find_station_with_data(user_lat, user_lon, date_obj):
     """
-    Use pre-fetched STATION_METADATA to select the nearest station that has data for the requested date.
-    The function sorts stations by distance from the user and returns the first station whose metadata's
-    update time is on or after the requested date.
+    Use the pre-fetched STATION_METADATA to select the nearest station that has data for the requested date.
+    This function sorts stations by distance from the user and returns the first station whose metadata shows it
+    has been updated on or after the requested date.
     """
     if not STATION_METADATA:
         return None
@@ -165,8 +164,8 @@ def find_station_with_data(user_lat, user_lon, date_obj):
 def get_smhi_temperature_data_historical(station_id, date_obj, period_product):
     """
     Fetch historical weather data for a given station ID and date.
-    period_product should be "latest-month" or "corrected-archive".
-    Returns (day_data, query_url).
+    period_product should be either "latest-month" or "corrected-archive".
+    Returns a tuple: (day_data, query_url)
     """
     start = int(datetime(date_obj.year, date_obj.month, date_obj.day).timestamp() * 1000)
     end = int((datetime(date_obj.year, date_obj.month, date_obj.day) + timedelta(days=1)).timestamp() * 1000)
@@ -193,9 +192,9 @@ def get_smhi_temperature_data_historical(station_id, date_obj, period_product):
 
 def get_smhi_temperature_data_forecast(lat, lon, date_obj):
     """
-    Fetch forecast weather data using the SMHI forecast endpoint.
+    Fetch forecast data using the SMHI forecast endpoint.
     Coordinates are rounded to three decimal places.
-    Returns (forecasts, query_url).
+    Returns a tuple: (forecasts, query_url)
     """
     lon_str = f"{lon:.3f}"
     lat_str = f"{lat:.3f}"
@@ -226,12 +225,11 @@ def get_smhi_temperature_data_forecast(lat, lon, date_obj):
     return forecasts, url
 
 #############################
-# LLM Summary Function using OpenRouter
+# LLM Summary Function using OpenRouter and Text-Generation Task
 #############################
 def get_llm_summary(city, date_obj, weather_data):
     """
-    Build a prompt from the weather data summary and query OpenRouter's API for text generation.
-    This function uses the text-generation task.
+    Build a prompt from the weather data summary and query OpenRouter's API using a text-generation task.
     """
     temperatures = []
     for record in weather_data:
@@ -252,11 +250,8 @@ def get_llm_summary(city, date_obj, weather_data):
         "Please provide a friendly summary of what the weather will be like and suggest some activities for that day in a conversational tone."
     )
     
-    # Use OpenRouter's endpoint. OpenRouter's API is similar to OpenAI's.
-    OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-    
     payload = {
-        "model": "gpt-3.5-turbo",   # You can change this if desired.
+        "model": "gpt-3.5-turbo",  # You may change this to your desired model as supported by OpenRouter.
         "messages": [
             {"role": "system", "content": "You are a helpful weather assistant."},
             {"role": "user", "content": prompt}
