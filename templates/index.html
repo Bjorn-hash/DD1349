@@ -54,6 +54,12 @@
     <p class="error">{{ error_message }}</p>
   {% endif %}
 
+  {% if corrected_message %}
+    <div class="alert alert-info">
+      {{ corrected_message }}
+    </div>
+  {% endif %}
+
   {% if coordinates %}
     <h2>Coordinates for your city:</h2>
     <p>Latitude: {{ coordinates[0] }}, Longitude: {{ coordinates[1] }}</p>

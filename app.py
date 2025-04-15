@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request
 import requests
 import os
+import difflib
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from geopy.distance import geodesic
@@ -49,6 +50,15 @@ def transform_timestamps(data_list):
     return data_list
 
 #############################
+# Helper Function help correct city name spellings
+#############################
+def suggest_city_name(input_city, station_metadata):
+    all_cities = [station.get("name", "") for station in station_metadata]
+    suggestions = difflib.get_close_matches(input_city, all_cities, n=1, cutoff=0.6)
+    return suggestions[0] if suggestions else None
+
+
+#############################
 # Routes
 #############################
 @app.route("/", methods=["GET", "POST"])
@@ -59,6 +69,7 @@ def index():
     weather_data = None
     query_url = None
     error_message = None
+    corrected_message = None
     llm_answer = None  # This will hold the summary from OpenRouter
 
     if request.method == "POST":
@@ -70,10 +81,22 @@ def index():
         except ValueError:
             error_message = "Invalid date format."
 
+        # SUGGESTED CITY MANAGEMENT:
+        suggested_city = suggest_city_name(city, STATION_METADATA)
+        corrected_message = None
+        if suggested_city and suggested_city.lower() != city.lower():
+            corrected_message = f"Sökningen korrigerades till '{suggested_city}'."
+            city = suggested_city
+        coordinates = geocode_city(city)
+        if coordinates == (None, None):
+            error_message = "Could not find that city"
+
+
         if city and selected_date:
             coordinates = geocode_city(city)
-            if not coordinates:
-                error_message = "Could not find that city."
+
+            if coordinates == (None, None):
+                error_message = "Could not find that city"
             else:
                 station_info = find_station_with_data(coordinates[0], coordinates[1], selected_date)
                 if not station_info:
@@ -103,6 +126,7 @@ def index():
                            weather_data=weather_data,
                            query_url=query_url,
                            error_message=error_message,
+                           corrected_message=corrected_message,
                            llm_answer=llm_answer)
 
 #############################
@@ -114,6 +138,10 @@ def geocode_city(city_name):
     response = requests.get(url)
     data = response.json()
     print("OpenCage response:", data)
+
+
+
+
     if data.get("results"):
         lat = data["results"][0]["geometry"]["lat"]
         lon = data["results"][0]["geometry"]["lng"]
