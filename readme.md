@@ -40,3 +40,45 @@ This project is a smart weather assistant built using Flask. The app allows user
    ```bash
    git clone *REPOSITORY*
    python app.py
+   ```
+## 5.2 How to Install & Use on Linux using virtual environment
+
+1. **Clone & open the Repository**
+   ```bash
+   git clone *REPOSITORY_URL*
+   cd DD1349
+   ```
+
+2. **Install & set up virtual environment**
+
+   Install required tools, venv and pip.
+   ```bash
+   sudo apt install python3 python3-venv python3-pip
+   ```
+   Create virtual environment
+   ```bash
+   python3 -m venv venv
+   ```
+   this will create venv/ folder in the directory
+
+   Activate virtual environment
+   ```bash
+   source venv/bin/activate
+   ```
+   You should now see `(venv)` at the beginning of your terminal prompt.
+
+   Install requirements
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. **Run inside virtual environment**
+
+   Inside the virtual environment
+   ```bash
+   python app.py
+   ```
+4. **Exiting virtual environment**
+
+   ```bash
+   deactivate
+   ```
