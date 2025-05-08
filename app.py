@@ -4,6 +4,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from geopy.distance import geodesic
+from zoneinfo import ZoneInfo
 
 # Load environment variables (make sure your .env file is in the same directory)
 load_dotenv()
@@ -39,14 +40,21 @@ print(f"Fetched {len(STATION_METADATA)} stations from SMHI metadata.")
 #############################
 # Helper Function to Transform Timestamps
 #############################
-def transform_timestamps(data_list):
-    """
-    Convert each observation's 'date' (epoch in milliseconds) to a human‐readable date string (UTC)
-    and add it as a new key "readable_date" to each record.
-    """
+def transform_timestamps(data_list, tz_str="Europe/Stockholm"):
+    local_tz = ZoneInfo(tz_str)
     for record in data_list:
-        record['readable_date'] = datetime.utcfromtimestamp(record['date'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        utc_dt = datetime.utcfromtimestamp(record['date'] / 1000).replace(tzinfo=ZoneInfo("UTC"))
+        local_dt = utc_dt.astimezone(local_tz)
+        record['readable_date'] = local_dt.strftime('%Y-%m-%d %H:%M:%S')
+        record['local_datetime'] = local_dt  # Useful for filtering
     return data_list
+
+def filter_data_to_selected_day(weather_data, selected_date, tz_str="Europe/Stockholm"):
+    local_tz = ZoneInfo(tz_str)
+    start_dt = datetime.combine(selected_date, datetime.min.time()).replace(tzinfo=local_tz)
+    end_dt = start_dt + timedelta(days=1)
+    return [record for record in weather_data if start_dt <= record["local_datetime"] < end_dt]
+
 
 #############################
 # Routes
@@ -62,25 +70,30 @@ def index():
     llm_answer = None  # This will hold the summary from OpenRouter
 
     if request.method == "POST":
+        # Get city and date from form
         city = request.form["city"]
         date_str = request.form["date"]
 
         try:
+            # Convert string to datetime object
             selected_date = datetime.strptime(date_str, "%Y-%m-%d")
         except ValueError:
             error_message = "Invalid date format."
 
+        # If city  and date are valid:
         if city and selected_date:
             coordinates = geocode_city(city)
             if not coordinates:
                 error_message = "Could not find that city."
             else:
+                # Find nearby station with data for that date
                 station_info = find_station_with_data(coordinates[0], coordinates[1], selected_date)
                 if not station_info:
                     error_message = "No station found with data for the selected date."
                 else:
                     station_id = station_info.get("id")
                     today = datetime.today()
+
                     if selected_date.date() >= today.date():
                         weather_data, query_url = get_smhi_temperature_data_forecast(coordinates[0], coordinates[1], selected_date)
                     else:
@@ -94,8 +107,10 @@ def index():
                         error_message = "No weather data available for that date."
                     else:
                         weather_data = transform_timestamps(weather_data)
+                        weather_data = filter_data_to_selected_day(weather_data, selected_date)
                         llm_answer = get_llm_summary(city, selected_date, weather_data)
     
+    #Render result in web interface
     return render_template("index.html",
                            coordinates=coordinates,
                            selected_date=selected_date,
@@ -245,6 +260,7 @@ def get_llm_summary(city, date_obj, weather_data):
     else:
         summary_line = "No temperature data available."
     
+    # Prompt for GPT model
     prompt = (
         f"Based on the weather data for {city} on {date_obj.strftime('%Y-%m-%d')}, which is summarized as: {summary_line}.\n\n"
         "Please provide a friendly summary of what the weather will be like and suggest some activities for that day in a conversational tone."
@@ -258,7 +274,8 @@ def get_llm_summary(city, date_obj, weather_data):
         ],
         "max_tokens": 150
     }
-    
+
+   # Call openrouter API
     try:
         response = requests.post(OPENROUTER_API_URL, headers={"Authorization": f"Bearer {OPENROUTER_API_TOKEN}"}, json=payload, timeout=60)
         print("OpenRouter API status code:", response.status_code)
@@ -270,5 +287,6 @@ def get_llm_summary(city, date_obj, weather_data):
         print("Error calling OpenRouter API:", e)
         return "Sorry, I couldn't generate a weather summary at this time."
 
+# Run the app
 if __name__ == "__main__":
     app.run(debug=True)
